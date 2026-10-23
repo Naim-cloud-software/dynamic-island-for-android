@@ -1,0 +1,585 @@
+name: Build NCS Dynamic Island
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate Android project
+        shell: bash
+        run: |
+          mkdir -p app/src/main/java/nl/dynamicisland
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "NCSDynamicIsland"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "nl.dynamicisland"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "nl.dynamicisland"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "2.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.READ_PHONE_STATE"/>
+              <application
+                  android:label="NCS Dynamic Island"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar"
+                  android:usesCleartextTraffic="false">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".IslandService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="Display a customizable floating notification and media island"/>
+                  </service>
+                  <service
+                      android:name=".NotifListener"
+                      android:exported="true"
+                      android:label="NCS Dynamic Island notifications"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService"/>
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/nl/dynamicisland/MainActivity.kt <<'EOF'
+          package nl.dynamicisland
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.graphics.Color
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private lateinit var prefs: SharedPreferences
+              private lateinit var status: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  prefs = getSharedPreferences("island_settings", MODE_PRIVATE)
+
+                  val page = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(28), dp(20), dp(24))
+                      setBackgroundColor(Color.rgb(13, 15, 22))
+                  }
+                  val scroll = ScrollView(this)
+                  scroll.addView(page)
+
+                  page.addView(TextView(this).apply {
+                      text = "NCS DYNAMIC ISLAND"
+                      textSize = 25f
+                      setTextColor(Color.WHITE)
+                      typeface = android.graphics.Typeface.DEFAULT_BOLD
+                  })
+                  page.addView(TextView(this).apply {
+                      text = "Personaliseer je eiland. Wijzigingen worden lokaal opgeslagen."
+                      textSize = 14f
+                      setTextColor(Color.LTGRAY)
+                      setPadding(0, dp(8), 0, dp(18))
+                  })
+
+                  status = TextView(this).apply {
+                      text = "Pas instellingen aan en druk op Start / vernieuwen."
+                      setTextColor(Color.rgb(100, 230, 190))
+                      textSize = 13f
+                  }
+                  page.addView(status)
+
+                  section(page, "POSITIE")
+                  val positions = listOf(
+                      "Midden boven" to "center",
+                      "Links boven" to "left",
+                      "Rechts boven" to "right",
+                      "Midden onder" to "bottom"
+                  )
+                  val spinner = Spinner(this)
+                  spinner.adapter = ArrayAdapter(
+                      this, android.R.layout.simple_spinner_dropdown_item,
+                      positions.map { it.first }
+                  )
+                  val savedPosition = prefs.getString("position", "center")
+                  spinner.setSelection(positions.indexOfFirst { it.second == savedPosition }.coerceAtLeast(0))
+                  page.addView(spinner)
+                  spinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+                      override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+                      override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, pos: Int, id: Long) {
+                          prefs.edit().putString("position", positions[pos].second).apply()
+                      }
+                  }
+
+                  section(page, "FORMAAT")
+                  addSlider(page, "Breedte", 110, 300, prefs.getInt("width", 190), "width")
+                  addSlider(page, "Hoogte", 32, 100, prefs.getInt("height", 38), "height")
+                  addSlider(page, "Afstand vanaf rand", 0, 160, prefs.getInt("offset", 6), "offset")
+
+                  section(page, "THEMA")
+                  val themes = listOf("Zwart" to "black", "NCS turquoise" to "turquoise", "Paars" to "purple", "Rood" to "red")
+                  val themeSpinner = Spinner(this)
+                  themeSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, themes.map { it.first })
+                  themeSpinner.setSelection(themes.indexOfFirst { it.second == prefs.getString("theme", "black") }.coerceAtLeast(0))
+                  page.addView(themeSpinner)
+                  themeSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+                      override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+                      override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, pos: Int, id: Long) {
+                          prefs.edit().putString("theme", themes[pos].second).apply()
+                      }
+                  }
+
+                  section(page, "FUNCTIES")
+                  addToggle(page, "Muziekbediening", "music", true)
+                  addToggle(page, "Meldingen tonen", "notifications", true)
+                  addToggle(page, "Batterijstatus bij opladen", "battery", true)
+                  addToggle(page, "Animaties", "animations", true)
+
+                  section(page, "MACHTIGINGEN")
+                  addButton(page, "1. Overlay-toegang instellen") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  }
+                  addButton(page, "2. Meldingen toestaan") {
+                      startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                  }
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      addButton(page, "3. Appmeldingen toestaan") {
+                          requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 10)
+                      }
+                  }
+
+                  addButton(page, "START / VERNIEUW ISLAND") {
+                      if (!Settings.canDrawOverlays(this)) {
+                          status.text = "Geef eerst overlay-toegang en druk daarna opnieuw."
+                          startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                      } else {
+                          try {
+                              startForegroundService(Intent(this, IslandService::class.java).setAction("REFRESH"))
+                              status.text = "Island gestart. Instellingen zijn opgeslagen."
+                          } catch (e: Exception) {
+                              status.text = "Starten mislukt: ${e.javaClass.simpleName}"
+                          }
+                      }
+                  }
+                  addButton(page, "STOP ISLAND") {
+                      stopService(Intent(this, IslandService::class.java))
+                      status.text = "Island gestopt."
+                  }
+                  addButton(page, "HERSTEL STANDAARDINSTELLINGEN") {
+                      prefs.edit().clear().apply()
+                      status.text = "Standaardinstellingen opgeslagen. Start de Island opnieuw."
+                      recreate()
+                  }
+                  page.addView(TextView(this).apply {
+                      text = "NCS — Naim Cloud Software"
+                      setTextColor(Color.GRAY)
+                      gravity = Gravity.CENTER
+                      setPadding(0, dp(22), 0, dp(4))
+                  })
+                  setContentView(scroll)
+              }
+
+              private fun section(parent: LinearLayout, title: String) {
+                  parent.addView(TextView(this).apply {
+                      text = title
+                      textSize = 13f
+                      setTextColor(Color.rgb(80, 220, 190))
+                      typeface = android.graphics.Typeface.DEFAULT_BOLD
+                      setPadding(0, dp(20), 0, dp(7))
+                  })
+              }
+
+              private fun addSlider(parent: LinearLayout, title: String, min: Int, max: Int, initial: Int, key: String) {
+                  val label = TextView(this).apply { setTextColor(Color.WHITE); textSize = 14f }
+                  parent.addView(label)
+                  parent.addView(SeekBar(this).apply {
+                      this.max = max - min
+                      progress = (initial - min).coerceIn(0, max - min)
+                      fun update() {
+                          val value = progress + min
+                          label.text = "$title: $value dp"
+                          prefs.edit().putInt(key, value).apply()
+                      }
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(seekBar: SeekBar?, p: Int, fromUser: Boolean) { update() }
+                          override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+                          override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+                      })
+                      update()
+                  })
+              }
+
+              private fun addToggle(parent: LinearLayout, title: String, key: String, default: Boolean) {
+                  parent.addView(CheckBox(this).apply {
+                      text = title
+                      setTextColor(Color.WHITE)
+                      buttonTintList = android.content.res.ColorStateList.valueOf(Color.rgb(80, 220, 190))
+                      isChecked = prefs.getBoolean(key, default)
+                      setOnCheckedChangeListener { _, checked -> prefs.edit().putBoolean(key, checked).apply() }
+                  })
+              }
+
+              private fun addButton(parent: LinearLayout, title: String, action: () -> Unit) {
+                  parent.addView(Button(this).apply {
+                      text = title
+                      isAllCaps = false
+                      setOnClickListener { action() }
+                      layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                          topMargin = dp(6)
+                      }
+                  })
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+          }
+          EOF
+
+          cat > app/src/main/java/nl/dynamicisland/NotifListener.kt <<'EOF'
+          package nl.dynamicisland
+
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+
+          class NotifListener : NotificationListenerService() {
+              override fun onNotificationPosted(sbn: StatusBarNotification) {
+                  if (sbn.packageName == packageName || sbn.isOngoing) return
+                  if (!getSharedPreferences("island_settings", MODE_PRIVATE).getBoolean("notifications", true)) return
+                  val n = sbn.notification
+                  if (n.category == android.app.Notification.CATEGORY_TRANSPORT) return
+                  val extras = n.extras
+                  val appName = try {
+                      packageManager.getApplicationLabel(packageManager.getApplicationInfo(sbn.packageName, 0)).toString()
+                  } catch (_: Exception) { sbn.packageName }
+                  val title = extras.getCharSequence("android.title")?.toString() ?: appName
+                  val text = extras.getCharSequence("android.text")?.toString().orEmpty()
+                  IslandService.inst?.show("$appName · $title", text, n.contentIntent)
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/nl/dynamicisland/IslandService.kt <<'EOF'
+          package nl.dynamicisland
+
+          import android.app.*
+          import android.content.*
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.media.session.MediaController
+          import android.media.session.MediaSessionManager
+          import android.media.session.PlaybackState
+          import android.os.*
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class IslandService : Service() {
+              companion object { var inst: IslandService? = null }
+              private lateinit var wm: WindowManager
+              private lateinit var root: LinearLayout
+              private lateinit var lp: WindowManager.LayoutParams
+              private lateinit var title: TextView
+              private lateinit var subtitle: TextView
+              private lateinit var controls: LinearLayout
+              private val handler = Handler(Looper.getMainLooper())
+              private var pendingTap: PendingIntent? = null
+              private var media: MediaController? = null
+              private var temporary = false
+              private var expanded = false
+              private val prefs by lazy { getSharedPreferences("island_settings", MODE_PRIVATE) }
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == "REFRESH" && ::root.isInitialized) {
+                      applySettings()
+                      refreshIdle()
+                  }
+                  return START_STICKY
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  inst = this
+                  val channel = NotificationChannel("island", "NCS Dynamic Island", NotificationManager.IMPORTANCE_MIN)
+                  getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+                  val notification = Notification.Builder(this, "island")
+                      .setContentTitle("NCS Dynamic Island is actief")
+                      .setSmallIcon(android.R.drawable.ic_menu_info_details)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 34) startForeground(1, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  else startForeground(1, notification)
+
+                  if (!Settings.canDrawOverlays(this)) { stopSelf(); return }
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(dp(12), dp(4), dp(12), dp(4))
+                      setOnClickListener { onIslandTap() }
+                  }
+                  title = TextView(this).apply {
+                      setTextColor(Color.WHITE); textSize = 13f
+                      typeface = android.graphics.Typeface.DEFAULT_BOLD
+                      maxLines = 1; gravity = Gravity.CENTER
+                  }
+                  subtitle = TextView(this).apply {
+                      setTextColor(Color.LTGRAY); textSize = 11f; maxLines = 2; gravity = Gravity.CENTER
+                  }
+                  controls = LinearLayout(this).apply { gravity = Gravity.CENTER; visibility = View.GONE }
+                  fun control(label: String, action: () -> Unit) {
+                      controls.addView(TextView(this).apply {
+                          text = label; textSize = 22f; setTextColor(Color.WHITE)
+                          setPadding(dp(12), dp(3), dp(12), 0)
+                          setOnClickListener { action() }
+                      })
+                  }
+                  control("⏮") { media?.transportControls?.skipToPrevious() }
+                  control("⏯") {
+                      media?.let {
+                          if (it.playbackState?.state == PlaybackState.STATE_PLAYING) it.transportControls.pause()
+                          else it.transportControls.play()
+                      }
+                  }
+                  control("⏭") { media?.transportControls?.skipToNext() }
+                  root.addView(title); root.addView(subtitle); root.addView(controls)
+                  lp = WindowManager.LayoutParams(
+                      dp(prefs.getInt("width", 190)), dp(prefs.getInt("height", 38)),
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  applySettings()
+                  wm.addView(root, lp)
+
+                  val powerFilter = IntentFilter().apply {
+                      addAction(Intent.ACTION_POWER_CONNECTED)
+                      addAction(Intent.ACTION_POWER_DISCONNECTED)
+                  }
+                  registerReceiver(powerReceiver, powerFilter)
+                  poll.run()
+              }
+
+              private val powerReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context?, intent: Intent?) {
+                      if (!prefs.getBoolean("battery", true)) return
+                      if (intent?.action == Intent.ACTION_POWER_CONNECTED) show("⚡ Opladen", "Telefoon is aangesloten", null)
+                      else if (intent?.action == Intent.ACTION_POWER_DISCONNECTED) show("Batterij", "Opladen gestopt", null)
+                  }
+              }
+
+              private val poll = object : Runnable {
+                  override fun run() {
+                      try {
+                          val manager = getSystemService(MediaSessionManager::class.java)
+                          media = manager.getActiveSessions(ComponentName(this@IslandService, NotifListener::class.java))
+                              .firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
+                      } catch (_: SecurityException) { media = null }
+                      if (!temporary) refreshIdle()
+                      handler.postDelayed(this, 1200)
+                  }
+              }
+
+              private val collapse = Runnable { temporary = false; refreshIdle() }
+
+              private fun applySettings() {
+                  val width = dp(prefs.getInt("width", 190))
+                  val height = dp(prefs.getInt("height", 38))
+                  val offset = dp(prefs.getInt("offset", 6))
+                  val position = prefs.getString("position", "center")
+                  lp.width = width
+                  lp.height = height
+                  lp.y = if (position == "bottom") dp(120) else offset
+                  lp.gravity = when (position) {
+                      "left" -> Gravity.TOP or Gravity.LEFT
+                      "right" -> Gravity.TOP or Gravity.RIGHT
+                      "bottom" -> Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                      else -> Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                  }
+                  val color = when (prefs.getString("theme", "black")) {
+                      "turquoise" -> Color.rgb(0, 95, 90)
+                      "purple" -> Color.rgb(65, 35, 105)
+                      "red" -> Color.rgb(120, 20, 30)
+                      else -> Color.BLACK
+                  }
+                  root.background = GradientDrawable().apply {
+                      setColor(color)
+                      cornerRadius = dp(minOf(prefs.getInt("height", 38) / 2, 48)).toFloat()
+                  }
+                  if (::wm.isInitialized && root.parent != null) {
+                      try { wm.updateViewLayout(root, lp) } catch (_: Exception) {}
+                  }
+              }
+
+              private fun refreshIdle() {
+                  if (!::title.isInitialized) return
+                  val controller = if (prefs.getBoolean("music", true)) media else null
+                  if (controller != null) {
+                      val metadata = controller.metadata
+                      title.text = "♪ " + (metadata?.getString("android.media.metadata.TITLE") ?: "Muziek")
+                      subtitle.text = metadata?.getString("android.media.metadata.ARTIST").orEmpty()
+                      subtitle.visibility = if (expanded) View.VISIBLE else View.GONE
+                      controls.visibility = if (expanded) View.VISIBLE else View.GONE
+                      lp.width = dp(if (expanded) 300 else prefs.getInt("width", 190))
+                      lp.height = dp(if (expanded) 92 else prefs.getInt("height", 38))
+                  } else {
+                      expanded = false
+                      title.text = "NCS"
+                      subtitle.text = "Dynamic Island"
+                      subtitle.visibility = View.GONE
+                      controls.visibility = View.GONE
+                      lp.width = dp(prefs.getInt("width", 190))
+                      lp.height = dp(prefs.getInt("height", 38))
+                  }
+                  applySettings()
+              }
+
+              private fun onIslandTap() {
+                  if (temporary) {
+                      try { pendingTap?.send() } catch (_: Exception) {}
+                      temporary = false
+                      handler.removeCallbacks(collapse)
+                      refreshIdle()
+                  } else if (media != null && prefs.getBoolean("music", true)) {
+                      expanded = !expanded
+                      refreshIdle()
+                  }
+              }
+
+              fun show(text: String, sub: String, intent: PendingIntent?, duration: Long = 4500) {
+                  handler.post {
+                      if (!prefs.getBoolean("notifications", true) && !text.startsWith("⚡") && !text.startsWith("Batterij")) return@post
+                      temporary = true
+                      pendingTap = intent
+                      title.text = text
+                      subtitle.text = sub
+                      subtitle.visibility = View.VISIBLE
+                      controls.visibility = View.GONE
+                      lp.width = dp(maxOf(prefs.getInt("width", 190), 230))
+                      lp.height = dp(maxOf(prefs.getInt("height", 38), 64))
+                      applySettings()
+                      handler.removeCallbacks(collapse)
+                      handler.postDelayed(collapse, duration)
+                  }
+              }
+
+              override fun onDestroy() {
+                  handler.removeCallbacksAndMessages(null)
+                  try { unregisterReceiver(powerReceiver) } catch (_: Exception) {}
+                  if (::wm.isInitialized && ::root.isInitialized) {
+                      try { wm.removeView(root) } catch (_: Exception) {}
+                  }
+                  inst = null
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NCS-Dynamic-Island-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Create GitHub release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v2.${{ github.run_number }}" \
+            app/build/outputs/apk/debug/app-debug.apk \
+            --repo "${{ github.repository }}" \
+            --title "NCS Dynamic Island v2.${{ github.run_number }}" \
+            --notes "APK gebouwd door GitHub Actions." \
+            || echo "Release bestaat mogelijk al; APK staat ook bij Actions-artifacts."
